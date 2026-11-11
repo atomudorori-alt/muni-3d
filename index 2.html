@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>MUNI 3D</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;font-family:system-ui,sans-serif;color:#232849;background:#a8ddff;overscroll-behavior:none}
+canvas{display:block;width:100%;height:100%;touch-action:none}
+header{position:absolute;inset:max(12px,env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) auto max(14px,env(safe-area-inset-left));display:flex;justify-content:space-between;gap:8px;pointer-events:none;align-items:flex-start}
+.card{border-radius:18px;background:#fffef5ed;padding:10px 14px;box-shadow:0 4px 0 #42547e27}
+h1{margin:0;font-size:clamp(19px,5vw,30px);line-height:1;font-weight:950;letter-spacing:-.06em}small{font-size:11px;font-weight:700;color:#525d77}
+#score{white-space:nowrap;font-weight:900;color:#206571}
+#hint{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);text-align:center;width:max-content;max-width:94%;pointer-events:none}
+#touch{display:none;position:absolute;inset:auto max(14px,env(safe-area-inset-right)) calc(28px + env(safe-area-inset-bottom, 0px)) max(14px,env(safe-area-inset-left));align-items:flex-end;justify-content:space-between;pointer-events:none}
+#touch>* , #touch button{pointer-events:auto;touch-action:none;user-select:none;-webkit-user-select:none}
+#stick{position:relative;display:grid;place-items:center;width:104px;height:104px;border-radius:50%;border:2px solid #fff;background:#30395966}
+#nub{width:45px;height:45px;border-radius:50%;background:#fff4fc;border:4px solid #d983bb;pointer-events:none}
+.actions{display:flex;gap:8px;align-items:flex-end}
+button{font:inherit;font-weight:800;color:#222847;border:2px solid white;background:#fbd3ea;cursor:pointer}
+.actions button{border-radius:50%;height:70px;width:70px;font-size:12px;box-shadow:0 4px 0 #343a6266}
+#dash{background:#d1e7ff;height:60px;width:60px}
+#touch button:active{filter:brightness(.9)}
+#message{position:absolute;top:45%;left:50%;transform:translate(-50%,-50%);width:min(88%,320px);text-align:center;padding:20px;z-index:1}
+#message strong{display:block;font-size:21px;margin-bottom:8px}
+#reset{border-radius:10px;padding:8px 15px;margin-top:12px}
+.mobile{display:none}
+@media(any-pointer:coarse){#touch{display:flex}#hint{display:none}.mobile{display:inline}}
+@media(any-pointer:coarse) and (max-height:460px){#stick{width:82px;height:82px}#nub{width:34px;height:34px}.actions button{height:60px;width:60px}#dash{height:54px;width:54px}}
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="MUNI 3D ゲーム画面"></canvas>
+<header><div class="card"><h1>MUNI 3D</h1><small>クリスタルを全部集めよう<span class="mobile">・背景ドラッグで視点</span></small></div><div class="card" id="score" aria-live="polite">◆ 0 / 8</div></header>
+<div id="hint" class="card"><small>WASD / 矢印　移動　 ·　 Space　ジャンプ　 ·　 Shift　ダッシュ　 ·　 ドラッグ　視点</small></div>
+<div id="touch"><div id="stick" aria-label="移動スティック"><span id="nub"></span></div><div class="actions"><button id="dash" type="button">ダッシュ</button><button id="jump" type="button">ジャンプ</button></div></div>
+<div id="message" class="card"><strong id="status">読み込み中…</strong><button id="reset" type="button" hidden>もう一度遊ぶ</button></div>
+<script>
+'use strict';
+(() => {
+  const $ = id => document.getElementById(id);
+  const canvas = $('game'), ctx = canvas.getContext('2d');
+  const message = $('message'), score = $('score'), reset = $('reset');
+  const crystals = [[0,4],[5,6],[8,1],[6,-5],[0,-8],[-6,-6],[-8,0],[-5,5]]
+    .map(([x,z]) => ({x,z,collected:false}));
+  const keys = new Set(), player = {x:0,y:0,z:0,vy:0,facing:0,step:0};
+  let width, height, focal, yaw = 0, pitch = .37, last, time = 0, total = 0;
+  let jump = false, dash = null, drag = null, stick = null, joyX = 0, joyY = 0;
+  let eye, right, up, forward, faces;
+  const near = .25;
+
+  function resize() {
+    width = canvas.clientWidth;
+    height = canvas.clientHeight;
+    const ratio = Math.min(devicePixelRatio || 1, 2);
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
+    ctx.setTransform(ratio,0,0,ratio,0,0);
+    focal = Math.min(width * 1.26, height * 1.12);
+  }
+
+  function clearStick() {
+    stick = null;
+    joyX = joyY = 0;
+    $('nub').style.transform = '';
+  }
+
+  function clearInput() {
+    keys.clear();
+    clearStick();
+    dash = drag = null;
+    jump = false;
+  }
+
+  const bindings = new Set(['KeyW','KeyA','KeyS','KeyD','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','ShiftLeft','ShiftRight','Space']);
+  addEventListener('keydown', e => {
+    if (!bindings.has(e.code) || e.target instanceof HTMLButtonElement) return;
+    e.preventDefault();
+    keys.add(e.code);
+    if (e.code === 'Space' && !e.repeat) jump = true;
+  });
+  addEventListener('keyup', e => keys.delete(e.code));
+  addEventListener('blur', clearInput);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) clearInput(); });
+
+  function moveStick(e) {
+    const x = (e.clientX - stick.x)/stick.travel;
+    const y = (e.clientY - stick.y)/stick.travel;
+    const length = Math.max(1,Math.hypot(x,y));
+    joyX = x/length;
+    joyY = y/length;
+    $('nub').style.transform = 'translate('+joyX*stick.radius+'px,'+joyY*stick.radius+'px)';
+  }
+  $('stick').onpointerdown = e => {
+    if (stick !== null || e.button > 0) return;
+    const bounds = $('stick').getBoundingClientRect();
+    const isTouch = e.pointerType === 'touch';
+    // Start touch drags where the finger lands so every direction needs little travel.
+    stick = {
+      id: e.pointerId,
+      x: isTouch ? e.clientX : bounds.left + bounds.width/2,
+      y: isTouch ? e.clientY : bounds.top + bounds.height/2,
+      travel: bounds.width * (isTouch ? .22 : .32),
+      radius: bounds.width * .29
+    };
+    $('stick').setPointerCapture(e.pointerId);
+    moveStick(e);
+  };
+  $('stick').onpointermove = e => { if (e.pointerId === stick?.id) moveStick(e); };
+  $('jump').onclick = () => { jump = true; };
+  $('dash').onpointerdown = e => {
+    if (dash !== null) return;
+    dash = e.pointerId;
+    $('dash').setPointerCapture(dash);
+  };
+  canvas.onpointerdown = e => {
+    if (drag || e.button !== 0) return;
+    drag = {id:e.pointerId,x:e.clientX,y:e.clientY};
+    canvas.setPointerCapture(e.pointerId);
+  };
+  canvas.onpointermove = e => {
+    if (!drag || e.pointerId !== drag.id) return;
+    yaw -= (e.clientX-drag.x)*.008;
+    pitch = Math.max(.19,Math.min(.73,pitch+(e.clientY-drag.y)*.005));
+    drag.x = e.clientX;
+    drag.y = e.clientY;
+  };
+  for (const type of ['pointerup','pointercancel','lostpointercapture']) {
+    $('stick').addEventListener(type,e => {if (e.pointerId === stick?.id) clearStick();});
+    $('dash').addEventListener(type,e => {if (e.pointerId === dash) dash = null;});
+    canvas.addEventListener(type,e => {if (e.pointerId === drag?.id) drag = null;});
+  }
+  addEventListener('resize',resize);
+  reset.onclick = () => {
+    Object.assign(player,{x:0,y:0,z:0,vy:0,facing:0,step:0});
+    total = yaw = 0;
+    pitch = .37;
+    crystals.forEach(c => c.collected = false);
+    clearInput();
+    score.textContent = '◆ 0 / 8';
+    message.hidden = true;
+    reset.blur();
+  };
+
+  function update(dt) {
+    if (total === crystals.length) return;
+    const axis = (positive, negative) => Number(positive.some(k => keys.has(k))) - Number(negative.some(k => keys.has(k)));
+    const x = axis(['KeyD','ArrowRight'],['KeyA','ArrowLeft']) + joyX;
+    const z = axis(['KeyW','ArrowUp'],['KeyS','ArrowDown']) - joyY;
+    const length = Math.hypot(x,z);
+    if (length > .09) {
+      const running = dash !== null || keys.has('ShiftLeft') || keys.has('ShiftRight');
+      const speed = (running ? 8 : 4.3) * dt / Math.max(1,length);
+      const dx = x*Math.cos(yaw)+z*Math.sin(yaw);
+      const dz = z*Math.cos(yaw)-x*Math.sin(yaw);
+      player.x = Math.min(11.6,Math.max(-11.6,player.x+dx*speed));
+      player.z = Math.min(11.6,Math.max(-11.6,player.z+dz*speed));
+      player.facing = Math.atan2(dx,dz);
+      player.step += dt*(running ? 17 : 11);
+    } else player.step = 0;
+    if (jump && player.y === 0) player.vy = 7.3;
+    jump = false;
+    player.vy -= 19*dt;
+    player.y = Math.max(0,player.y+player.vy*dt);
+    if (player.y === 0) player.vy = 0;
+    for (const crystal of crystals) {
+      if (crystal.collected || Math.hypot(player.x-crystal.x,player.z-crystal.z) > .89 || player.y > 1.35) continue;
+      crystal.collected = true;
+      score.textContent = '◆ '+(++total)+' / '+crystals.length;
+      if (total === crystals.length) {
+        $('status').textContent = 'クリアむに！';
+        reset.hidden = false;
+        message.hidden = false;
+      }
+    }
+  }
+
+  function camera() {
+    const sy = Math.sin(yaw), cy = Math.cos(yaw), sp = Math.sin(pitch), cp = Math.cos(pitch);
+    const distance = 7.7;
+    right = [cy,0,-sy];
+    up = [sy*sp,cp,cy*sp];
+    forward = [sy*cp,-sp,cy*cp];
+    eye = [player.x-forward[0]*distance,1.05+player.y*.25-forward[1]*distance,player.z-forward[2]*distance];
+  }
+
+  function view([x,y,z]) {
+    x -= eye[0]; y -= eye[1]; z -= eye[2];
+    const dot = a => a[0]*x+a[1]*y+a[2]*z;
+    return [dot(right),dot(up),dot(forward)];
+  }
+
+  function draw(points,color) {
+    // Clip before dividing by depth, including polygons that cross the camera plane.
+    const vertices = points.map(view);
+    const clipped = [];
+    for (let i=0; i<vertices.length; i++) {
+      const a = vertices[i], b = vertices[(i+1)%vertices.length];
+      if (a[2] >= near) clipped.push(a);
+      if ((a[2] >= near) !== (b[2] >= near)) {
+        const t = (near-a[2])/(b[2]-a[2]);
+        clipped.push([a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,near]);
+      }
+    }
+    if (clipped.length < 3) return;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    clipped.forEach(([x,y,z],i) => {
+      const px = width/2+x*focal/z, py = height*.48-y*focal/z;
+      if (i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+    });
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function face(points,color) {
+    const center = points.reduce((a,p) => [a[0]+p[0],a[1]+p[1],a[2]+p[2]],[0,0,0]).map(n=>n/points.length);
+    faces.push({points,color,depth:view(center)[2]});
+  }
+
+  function box(x,y,z,w,h,d,colors,angle=0,ox=0,oz=0) {
+    const s=Math.sin(angle), c=Math.cos(angle);
+    const vertices=[[-1,0,-1],[1,0,-1],[1,0,1],[-1,0,1],[-1,1,-1],[1,1,-1],[1,1,1],[-1,1,1]]
+      .map(([a,b,k]) => {
+        const u=a*w/2+ox,v=k*d/2+oz;
+        return [x+u*c+v*s,y+b*h,z-u*s+v*c];
+      });
+    [[0,1,5,4],[1,2,6,5],[2,3,7,6],[3,0,4,7],[4,5,6,7]]
+      .forEach((indices,i)=>face(indices.map(j=>vertices[j]),colors[i]));
+  }
+
+  function render() {
+    camera();
+    const sky=ctx.createLinearGradient(0,0,0,height);
+    sky.addColorStop(0,'#8ab9fb'); sky.addColorStop(.7,'#e7f5ff'); sky.addColorStop(1,'#fef3ee');
+    ctx.fillStyle=sky;
+    ctx.fillRect(0,0,width,height);
+    draw([[-12,-1,-12],[12,-1,-12],[12,-1,12],[-12,-1,12]],'#869dad');
+    for (let x=-12;x<12;x+=2) {
+      for (let z=-12;z<12;z+=2) {
+        const border = x===-12 || z===-12 || x===10 || z===10;
+        const color = border ? '#84bcaf' : ((x+z)%4===0 ? '#a8d8b9' : '#afdcc0');
+        draw([[x,0,z],[x+2.002,0,z],[x+2.002,0,z+2.002],[x,0,z+2.002]],color);
+      }
+    }
+    const shadow=Array.from({length:14},(_,i)=>{
+      const a=i*Math.PI/7;
+      return [player.x+.51*Math.cos(a),.012,player.z+.41*Math.sin(a)];
+    });
+    draw(shadow,'#53678350');
+    faces=[];
+    const stone=['#9383b9','#a796d5','#8073a6','#a796cf','#d7caef'];
+    for (const [x,z,h] of [[-11,10,1.3],[11,10,1.9],[-11,-10,2],[11,-10,1.5],[-10,9,.6],[10,-9,.7]]) {
+      box(x,0,z,1,h,1,stone,.24);
+    }
+    crystals.forEach((crystal,i)=>{
+      if (crystal.collected) return;
+      const {x,z}=crystal,y=.9+Math.sin(time*3+i)*.11;
+      const ring=Array.from({length:4},(_,k)=>{
+        const a=time*1.8+k*Math.PI/2;
+        return [x+.34*Math.cos(a),y,z+.34*Math.sin(a)];
+      });
+      ring.forEach((v,k)=>{
+        const next=ring[(k+1)%4];
+        face([[x,y+.48,z],v,next],['#d9ffff','#68e7ed','#a2f8ff','#57c8e8'][k]);
+        face([[x,y-.44,z],v,next],['#35aabb','#187ba6','#4ecbd3','#308eb9'][k]);
+      });
+    });
+    const {x,y,z,facing,step}=player;
+    const dark=['#3c3b63','#4c486c','#574f79','#4c486c','#66618a'];
+    const pink=['#d777a6','#ec92be','#f4a8ce','#e18bb8','#ffd1e9'];
+    const hair=['#cb79aa','#de8eb9','#eb9ec9','#d283af','#ffb8df'];
+    const skin=['#e4adad','#efbdb8','#ffe2d2','#efbdb8','#ffeadf'];
+    box(x,y+.03,z,.22,.44,.29,dark,facing,-.19,.16*Math.sin(step));
+    box(x,y+.03,z,.22,.44,.29,dark,facing,.19,-.16*Math.sin(step));
+    box(x,y+.42,z,.69,.25,.49,dark,facing);
+    box(x,y+.64,z,.59,.58,.46,pink,facing);
+    box(x,y+.61,z,.17,.5,.27,pink,facing,-.38);
+    box(x,y+.61,z,.17,.5,.27,pink,facing,.38);
+    box(x,y+1.17,z,.75,.57,.61,hair,facing);
+    box(x,y+1.18,z,.57,.36,.08,skin,facing,0,.29);
+    box(x,y+1.38,z,.075,.09,.024,dark,facing,-.14,.338);
+    box(x,y+1.38,z,.075,.09,.024,dark,facing,.14,.338);
+    box(x,y+1.73,z,.11,.15,.11,hair,facing,-.08);
+    faces.sort((a,b)=>b.depth-a.depth);
+    faces.forEach(({points,color})=>draw(points,color));
+  }
+
+  function frame(now) {
+    const dt = last === undefined ? 0 : Math.min(.045,(now-last)/1000);
+    last=now;
+    time+=dt;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  try {
+    resize();
+    render();
+    message.hidden = true;
+    requestAnimationFrame(frame);
+  } catch (error) {
+    $('status').textContent = 'ゲーム画面を起動できませんでした。Safariで開き直してください。';
+    console.error(error);
+  }
+})();
+</script>
+</body>
+</html>
